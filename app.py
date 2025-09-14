@@ -5,6 +5,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from helpers import parse_plan_strict, PlanParseError, fs_normalize_args
 from mcp_client import bootstrap_clients
+from helpers import detect_repo_root, normalize_git_args
 
 
 
@@ -126,6 +127,21 @@ with st.sidebar:
             - Para fs.* usa rutas RELATIVAS; si el usuario da una ruta absoluta, usa solo su nombre dentro del directorio permitido.
             - Si no conoces el path base o el usuario no dio ruta, primero llama fs.list_allowed_directories y luego opera dentro de la primera ruta permitida.
             - Para fs.*, usa rutas RELATIVAS (sin '/' inicial). Si el usuario da una absoluta, usa solo el nombre dentro de la base permitida.
+            - Para todas las tools git, usa "repo_path":"." (NUNCA "/path/to/repository").
+            - NUNCA mezcles server y tool: la tool debe existir en el MISMO server elegido.
+            - Si la tool empieza con "git_" → usa server "git".
+            - Si la tool tiene  "file" → usa server "fs".
+            - Si la tool es "validate.email" / "validate.vat" / "validate.address" → usa server "remote".
+            - Si la tool empieza con "orders." o "webhooks." → usa server "local".
+            - Si la intención es validar email/NIT/dirección → usa "remote" + una de las validate.* (no git_*).
+            - Si la intención es Git (status, add, commit, checkout, show, log, diff, etc.) → usa server "git" + tool git_*.
+            - "repo_path" por defecto en todas las tools git: "." (NUNCA "/path/to/repo" ni placeholders).
+            - Devuelve SIEMPRE un JSON minificado válido (RFC8259). Si hay duda, plan nulo EXACTO:
+            {"server": null, "tool": null, "arguments": {}, "justification": "uncertain"}
+            - Si el usuario no da ruta, usa {"repo_path": "."} y deja que el cliente la normalice a la raíz del repo.
+            - Extrae nombres de archivos directamente del texto del usuario (ej: "hola.txt"); si dice "todos" o "todo", usa {"files": ["."]}.
+            - Responde SIEMPRE con JSON válido minificado. Si hay duda, devuelve el plan nulo EXACTO:
+            {"server": null, "tool": null, "arguments": {}, "justification": "uncertain"}
                     """.strip()
                 )
 
@@ -187,6 +203,13 @@ if user_text:
     arguments = plan.get("arguments", {})
     base_dir = (st.session_state.fs_bases or {}).get(server)
     arguments = fs_normalize_args(arguments, base_dir)
+
+    if "repo_abs" not in st.session_state:
+        st.session_state.repo_abs = os.getenv("GIT_REPO_ABS", detect_repo_root())
+
+    # Normaliza si es tool de git
+    if server == "git" and tool and tool.startswith("git_"):
+        arguments = normalize_git_args(arguments, st.session_state.repo_abs)
 
     justification = plan.get("justification")
 

@@ -3,7 +3,8 @@ import os, json, asyncio, shlex, httpx, subprocess
 from abc import ABC, abstractmethod
 
 JSONRPC_VERSION = "2.0"
-DEFAULT_PROTOCOL = "2024-09"
+# Permite sobreescribir por ENV; por defecto conserva 2024-09, pero muchos servers ya hablan 2025-06-18
+DEFAULT_PROTOCOL = os.getenv("MCP_PROTOCOL", "2024-09")
 
 INIT_STRICT = {
     "jsonrpc": JSONRPC_VERSION,
@@ -38,10 +39,15 @@ class BaseMCPClient(ABC):
 
     @abstractmethod
     async def _rpc(self, payload: dict) -> dict: ...
+    # Para notificaciones (por defecto hace RPC normal e ignora respuesta; STDIO lo sobreescribe)
+    async def _notify(self, payload: dict) -> None:
+        try:
+            await self._rpc(payload)
+        except Exception:
+            pass
 
     async def initialize(self) -> dict:
-        # 1) intentar strict
-        try_orders = []
+        # 1) intentar strict/minimal/empty según flag
         if self.strict_init:
             try_orders = [INIT_STRICT, INIT_MINIMAL, INIT_EMPTY]
         else:
@@ -54,20 +60,27 @@ class BaseMCPClient(ABC):
                 if "error" in resp:
                     last_err = resp["error"]
                     continue
-                return resp["result"]
+                # éxito
+                return resp.get("result", {})
             except Exception as e:
                 last_err = e
 
         raise RuntimeError(f"initialize failed: {last_err}")
 
+    async def notify_initialized(self):
+        """Envía notifications/initialized como NOTIFICACIÓN (sin id)."""
+        payload = {
+            "jsonrpc": JSONRPC_VERSION,
+            "method": "notifications/initialized",
+            "params": {}
+        }
+        await self._notify(payload)
+
     async def list_tools(self) -> list:
-        resp = await self._rpc({
-            "jsonrpc": JSONRPC_VERSION, "id": 2,
-            "method": "tools/list", "params": {}
-        })
+        resp = await self._rpc_lenient("tools/list", None, id=2)
         if "error" in resp:
             raise RuntimeError(resp["error"])
-        self.tools = resp["result"]["tools"]
+        self.tools = (resp.get("result") or {}).get("tools", [])
         return self.tools
 
     async def call_tool(self, name: str, arguments: dict) -> dict:
@@ -80,6 +93,33 @@ class BaseMCPClient(ABC):
             raise RuntimeError(resp["error"])
         return resp
 
+    async def _rpc_lenient(self, method: str, params: dict | None = None, id: int = 0) -> dict:
+        """
+        Para métodos sin parámetros definidos (p.ej. tools/list), prueba:
+        - sin 'params'
+        - con 'params': {}
+        - con 'params': null
+        Retorna la primera respuesta sin 'error' o la última si todas fallan.
+        """
+        if params is None:
+            last = None
+            for payload in (
+                {"jsonrpc": JSONRPC_VERSION, "id": id, "method": method},
+                {"jsonrpc": JSONRPC_VERSION, "id": id, "method": method, "params": {}},
+                {"jsonrpc": JSONRPC_VERSION, "id": id, "method": method, "params": None},
+            ):
+                resp = await self._rpc(payload)
+                last = resp
+                if "error" not in resp:
+                    return resp
+                # si no es -32602 (invalid params), no tiene sentido reintentar
+                if not isinstance(resp.get("error"), dict) or resp["error"].get("code") != -32602:
+                    return resp
+            return last or {"error": {"code": -32099, "message": "all attempts failed"}}
+        else:
+            return await self._rpc({"jsonrpc": JSONRPC_VERSION, "id": id, "method": method, "params": params})
+
+
 class HTTPMCPClient(BaseMCPClient):
     def __init__(self, name: str, base_url: str):
         super().__init__(name)
@@ -87,9 +127,16 @@ class HTTPMCPClient(BaseMCPClient):
 
     async def _rpc(self, payload: dict) -> dict:
         async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.post(f"{self.base_url}", json=payload)
+            r = await c.post(self.base_url, json=payload, headers={"Accept": "application/json"})
             r.raise_for_status()
-            return r.json()
+            # algunos servers podrían no responder JSON en notificaciones; intenta parsear y si falla, devuelve {}
+            try:
+                return r.json()
+            except Exception:
+                return {}
+
+    # En HTTP no hace falta override de _notify (el de base ya ignora la respuesta)
+
 
 class StdioMCPClient(BaseMCPClient):
     def __init__(self, name: str, cmd: str):
@@ -129,6 +176,17 @@ class StdioMCPClient(BaseMCPClient):
         self.proc.stdin.flush()
         return await self._read_json_line()
 
+    async def _notify(self, payload: dict) -> None:
+        """En STDIO, escribe la notificación y NO esperes respuesta."""
+        if self.proc.poll() is not None:
+            return
+        line = json.dumps(payload, ensure_ascii=False)
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+        # pequeño respiro para que el server procese el estado
+        await asyncio.sleep(0.05)
+
+
 async def bootstrap_clients():
     clients = {}
 
@@ -138,15 +196,25 @@ async def bootstrap_clients():
         name, url = pair.split(":", 1)
         cli = HTTPMCPClient(name, url)
         await cli.initialize()
+        # típicamente no se requiere notification para HTTP
         await cli.list_tools()
         clients[name] = cli
 
     # STDIO endpoints (e.g., filesystem, git, etc.)
     stdio_cfg = os.getenv("MCP_STDIO", "")
+    notify_list = set(
+        x.strip() for x in os.getenv("MCP_INIT_NOTIFY", "git,github").split(",") if x.strip()
+    )
+
     for pair in filter(None, (x.strip() for x in stdio_cfg.split(","))):
         name, cmd = pair.split(":", 1)
         cli = StdioMCPClient(name, cmd)
         await cli.initialize()
+
+        # 🔑 Notificación solo a los servers indicados (p.ej. git/github)
+        if name in notify_list:
+            await cli.notify_initialized()
+
         await cli.list_tools()
         clients[name] = cli
 

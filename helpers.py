@@ -4,6 +4,8 @@ from typing import Tuple, Optional
 FS_PATH_KEYS = {"path", "source", "destination"}  
 from pathlib import Path
 from typing import Dict, Any, List
+import os, subprocess
+
 class PlanParseError(Exception):
     def __init__(self, message: str, *, raw: str, cleaned: str, candidate: Optional[str], last_error: Optional[Exception]):
         super().__init__(message)
@@ -92,3 +94,46 @@ def fs_normalize_args(args: Dict[str, Any], base_dir: str | None) -> Dict[str, A
                 for p in v
             ]
     return fixed
+
+
+
+def detect_repo_root(fallback: str | None = None) -> str:
+    """
+    Devuelve la raíz ABSOLUTA del repo git actual.
+    Si falla, usa fallback o cwd.
+    """
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=os.getcwd(),
+        ).strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    return fallback or os.getcwd()
+
+def normalize_git_args(arguments: dict, repo_abs: str) -> dict:
+    """
+    - Rellena/normaliza repo_path:
+        .  -> repo_abs
+        "/path/to/repository" -> repo_abs
+        relativo -> absolutiza contra repo_abs
+    - files: si viene string -> list
+    """
+    a = dict(arguments or {})
+    rp = a.get("repo_path")
+
+    if not rp or rp == "." or rp == "/path/to/repository":
+        a["repo_path"] = repo_abs
+    else:
+        # si no es absoluta, hazla absoluta respecto al repo
+        if not os.path.isabs(rp):
+            a["repo_path"] = os.path.abspath(os.path.join(repo_abs, rp))
+
+    if "files" in a and isinstance(a["files"], str):
+        a["files"] = [a["files"]]
+
+    return a

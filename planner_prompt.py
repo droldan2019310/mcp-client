@@ -4,7 +4,8 @@ import json
 BASE_RULES = """Eres un router de herramientas MCP. Devuelve SOLO JSON válido.
 Tu salida DEBE tener el formato:
 {
-  "server": "<nombre_server>",
+  "server": "<nombre_server> ",
+- SERVERS VÁLIDOS: usa solo {"fs","git","local","remote"}.
   "tool": "<nombre_tool>",
   "arguments": { ... },
   "justification": "breve razonamiento"
@@ -26,9 +27,7 @@ def tools_catalog_block(clients) -> str:
         for t in cli.tools:
             lines.append(f"- server: {sname}")
             lines.append(f"  tool: {t.get('name')}")
-            desc = t.get("description", "").strip()
-            if desc:
-                lines.append(f"  desc: {desc}")
+           
             schema = t.get("inputSchema") or {}
             # Recorta el schema si es gigante
             schema_json = json.dumps(schema, ensure_ascii=False)
