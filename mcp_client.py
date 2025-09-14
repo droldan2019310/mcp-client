@@ -9,14 +9,14 @@ class MCPClientHTTP:
     async def initialize(self):
         payload = {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(f"{self.base_url}/mcp", json=payload)
+            r = await c.post(f"{self.base_url}", json=payload)
             r.raise_for_status()
             return r.json()
 
     async def list_tools(self):
         payload = {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(f"{self.base_url}/mcp", json=payload)
+            r = await c.post(f"{self.base_url}", json=payload)
             r.raise_for_status()
             data = r.json()
         self.tools = data.get("result", {}).get("tools", [])
@@ -30,7 +30,7 @@ class MCPClientHTTP:
             "params": {"name": name, "arguments": arguments}
         }
         async with httpx.AsyncClient(timeout=60) as c:
-            r = await c.post(f"{self.base_url}/mcp", json=payload)
+            r = await c.post(f"{self.base_url}", json=payload)
             r.raise_for_status()
             return r.json()
 
