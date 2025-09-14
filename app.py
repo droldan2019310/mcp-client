@@ -3,8 +3,14 @@ import os, json, asyncio, time
 import httpx
 import streamlit as st
 from dotenv import load_dotenv
-from helpers import parse_plan_strict
+from helpers import parse_plan_strict, PlanParseError, fs_normalize_args
 from mcp_client import bootstrap_clients
+
+
+
+from mcp_config_loader import load_mcp_config, build_clients_from_config
+from planner_prompt import build_dynamic_planner_prompt
+
 
 load_dotenv()
 
@@ -46,35 +52,22 @@ async def ollama_complete(prompt: str, model: str = None) -> str:
         data = r.json()
     return data.get("response", "")
 
-PLANNER_SYS = """Eres un router de herramientas MCP. Devuelve SOLO JSON válido.
-Dado el mensaje del usuario, selecciona UNA tool con argumentos.
-Formato:
-{
-  "server": "local|remote",
-  "tool": "nombre_de_la_tool",
-  "arguments": { ... },
-  "justification": "breve razonamiento"
-}
-REGLAS: 
-Si el usuario pide analizar una orden -> usa local.orders.analyze con {"order_id": <id>}
-Si pide marcar pagada -> usa local.webhooks.order_paid con {"order_id": <id>, "secret": ENV_SECRET}
-Si pide transformar/enviar mocks -> usa local.orders.transform / local.orders.send_mock
-Si pide validar email/NIT/dirección -> usa remote.validate.email / remote.validate.vat / remote.validate.address
-Si no estás seguro, sugiere una pregunta de clarificación devolviendo:
-{ "server": null, "tool": null, "arguments": {}, "justification": "..." }
 
-Si pides validar email -> usa remote.validate.email con {"email":"<correo>"} (NO uses "value")
-Si pides validar NIT -> usa remote.validate.vat con {"vat":"<nit>"} (NO uses "value")
-Si pides validar dirección -> usa remote.validate.address con {"address":"<texto>"} (NO uses "value")
-FORMATO ESTRICTO:
-- Devuelve SOLO un JSON válido (RFC 8259), minificado, sin backticks, sin comentarios, sin texto antes o después.
-- Nada de ``` ni ... ni explicaciones.
-- Si usas webhooks.order_paid incluye "secret": "{MCP_WEBHOOK_SECRET}" en arguments.
+if "clients" not in st.session_state:
+    st.session_state.clients = None
+if "tools_index" not in st.session_state:
+    st.session_state.tools_index = {}
+if "planner_system" not in st.session_state:
+    st.session_state.planner_system = None
+if "fs_bases" not in st.session_state:
+    st.session_state.fs_bases = {}  
 
-"""
+
 
 def build_user_prompt(user_text: str):
-    return f"""{PLANNER_SYS}
+    # Usa el planner dinámico 
+    sys = st.session_state.planner_system or "Eres un router MCP. Devuelve JSON."
+    return f"""{sys}
 
 Usuario:
 {user_text}
@@ -86,7 +79,7 @@ IMPORTANTE:
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title="MCP Chatbot", page_icon="🤖", layout="wide")
-st.title("🤖 MCP Chatbot (Streamlit + Ollama)")
+st.title("🤖 MCP Chatbot")
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -115,6 +108,36 @@ with st.sidebar:
     st.divider()
     st.caption("Modelo Ollama")
     st.write(os.getenv("OLLAMA_MODEL", "llama3.1"))
+    st.divider()
+    st.caption("Config MCP dinámica")
+    cfg_path = st.text_input("Ruta config JSON", value="mcp.config.json")
+    
+    
+    if st.session_state.clients:
+            # Construye y guarda el prompt DINÁMICO del planner (con catálogo real)
+        st.session_state.planner_system = build_dynamic_planner_prompt(
+            st.session_state.clients,
+            extra_rules="""
+            - Devuelve SIEMPRE un JSON minificado válido (RFC8259).
+            - PROHIBIDO texto libre, disculpas o notas. Nada de ``` ni markdown.
+            - Si hay duda, usa plan nulo EXACTO:
+            {"server": null, "tool": null, "arguments": {}, "justification": "uncertain"}
+            - No inventes tools ni argumentos fuera del inputSchema listado.
+            - Para fs.* usa rutas RELATIVAS; si el usuario da una ruta absoluta, usa solo su nombre dentro del directorio permitido.
+            - Si no conoces el path base o el usuario no dio ruta, primero llama fs.list_allowed_directories y luego opera dentro de la primera ruta permitida.
+            - Para fs.*, usa rutas RELATIVAS (sin '/' inicial). Si el usuario da una absoluta, usa solo el nombre dentro de la base permitida.
+                    """.strip()
+                )
+
+        with st.expander("⚙️ Ver prompt del planner (system)"):
+            st.code(st.session_state.planner_system, language="markdown")
+            st.divider()
+        st.subheader("Tools detectadas")
+        for sname, cli in st.session_state.clients.items():
+            st.markdown(f"**Server:** `{sname}`")
+            for t in cli.tools:
+                st.write(f"- `{t['name']}` — {t.get('description','')}")
+
 
 # historial
 for m in st.session_state.messages:
@@ -132,18 +155,39 @@ if user_text:
         with st.spinner("Pensando plan con Ollama…"):
             plan_raw = asyncio.run(ollama_complete(build_user_prompt(user_text)))
 
-    # 2) Parse plan
     plan = {}
     try:
-        plan = parse_plan_strict(plan_raw)
-
-    except Exception:
+        plan, dbg = parse_plan_strict(plan_raw, return_debug=True)
+    except PlanParseError as e:
         st.error("El plan no es JSON válido. Ajusta el prompt o verifica el modelo.")
+        with st.expander("Ver depuración del plan (raw/cleaned/candidate)"):
+            st.markdown("**Raw (respuesta del modelo):**")
+            st.code(e.raw or "", language="json")
+
+            st.markdown("**Cleaned (tras limpieza):**")
+            st.code(e.cleaned or "", language="json")
+
+            if e.candidate:
+                st.markdown("**Candidate (bloque detectado):**")
+                st.code(e.candidate, language="json")
+
+            if e.last_error:
+                st.markdown("**Último error de json.loads():**")
+                st.code(repr(e.last_error))
+
+        st.stop()
+    except Exception as e:
+        st.error(f"Fallo inesperado al parsear el plan: {e}")
+        with st.expander("Trace rápido"):
+            st.code(repr(e))
         st.stop()
 
     server = plan.get("server")
     tool = plan.get("tool")
     arguments = plan.get("arguments", {})
+    base_dir = (st.session_state.fs_bases or {}).get(server)
+    arguments = fs_normalize_args(arguments, base_dir)
+
     justification = plan.get("justification")
 
     if not server or not tool:

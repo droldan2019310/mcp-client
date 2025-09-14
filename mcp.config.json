@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "git": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-git", "."]
+    },
+    "local": {
+      "transport": "http",
+      "url": "http://localhost:8080"
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://mcp-server-remote-tqud.onrender.com"
+    }
+  }
+}
